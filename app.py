@@ -24,7 +24,7 @@ import docx2txt
 
 # ============ 全局常量配置 ============
 CHROMA_PERSIST_DIRECTORY = "./chroma_db"
-EMB_MODEL_NAME = "BAAI/bge-large-zh-v1.5"  # 升级为更强的中文模型
+EMB_MODEL_NAME = "BAAI/bge-small-zh-v1.5"  # 升级为更强的中文模型
 
 # ============ 新增：兼容本地/部署环境的API Key读取函数 ============
 def get_api_key(key_name: str) -> str:
