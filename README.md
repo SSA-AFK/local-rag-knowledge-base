@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 一个完全本地运行的中文 RAG（检索增强生成）应用，支持上传 PDF、DOCX、TXT、MD 文档，构建私有知识库，使用通义千问（Qwen）或 DeepSeek 进行高质量问答。
+<img width="2560" height="1600" alt="6f799acfb243d8761fbea4d314ae67a9" src="https://github.com/user-attachments/assets/be4cb451-836c-4c66-9843-01efd29143df" />
 
 **核心亮点（适合写在简历里）**：
 - 完整 LangChain 现代 LCEL 链式构建
