@@ -26,6 +26,23 @@ import docx2txt
 CHROMA_PERSIST_DIRECTORY = "./chroma_db"
 EMB_MODEL_NAME = "BAAI/bge-large-zh-v1.5"  # 升级为更强的中文模型
 
+# ============ 新增：兼容本地/部署环境的API Key读取函数 ============
+def get_api_key(key_name: str) -> str:
+    """
+    优先从Streamlit Secrets读取（部署环境），其次从本地环境变量/.env读取（开发环境）
+    :param key_name: API Key的名称（如DASHSCOPE_API_KEY、DEEPSEEK_API_KEY）
+    :return: 有效的API Key字符串，读取失败则返回空字符串
+    """
+    # 1. 优先读取Streamlit Cloud的Secrets（部署环境）
+    if key_name in st.secrets:
+        return st.secrets[key_name].strip()
+    # 2. 其次读取本地环境变量/.env文件（开发环境）
+    elif key_name in os.environ:
+        return os.getenv(key_name, "").strip()
+    # 3. 都读取不到则返回空字符串
+    else:
+        return ""
+
 
 def init_page() -> None:
     st.set_page_config(page_title="中文 RAG 知识库助手", page_icon="📚", layout="wide")
@@ -138,9 +155,10 @@ def get_llm(provider: str, model_name: str):
     load_dotenv(override=False)
 
     if provider == "Qwen (通义千问)":
-        api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+        # 改动1：使用新的get_api_key函数读取
+        api_key = get_api_key("DASHSCOPE_API_KEY")
         if not api_key:
-            st.error("未检测到 DASHSCOPE_API_KEY，请在 .env 中配置。")
+            st.error("未检测到 DASHSCOPE_API_KEY，请检查：\n1. 本地环境：配置.env文件或系统环境变量\n2. 部署环境：在Streamlit Cloud的Secrets中配置")
             return None
         return ChatOpenAI(
             model=model_name,
@@ -150,9 +168,10 @@ def get_llm(provider: str, model_name: str):
         )
 
     elif provider == "DeepSeek":
-        api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+        # 改动2：使用新的get_api_key函数读取
+        api_key = get_api_key("DEEPSEEK_API_KEY")
         if not api_key:
-            st.error("未检测到 DEEPSEEK_API_KEY，请在 .env 中配置。")
+            st.error("未检测到 DEEPSEEK_API_KEY，请检查：\n1. 本地环境：配置.env文件或系统环境变量\n2. 部署环境：在Streamlit Cloud的Secrets中配置")
             return None
         return ChatDeepSeek(
             model=model_name,
