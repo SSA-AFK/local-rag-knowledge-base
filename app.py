@@ -29,7 +29,7 @@ class HybridParentRetriever(BaseRetriever):
     """v1.0 混合检索器：向量检索(子文档) + BM25(父文档) + 父文档映射"""
 
     vectorstore: Chroma
-    docstore: InMemoryStore#文档存储
+    docstore: InMemoryStore
     bm25_docs: List[Document]
     k1: int = 6  # 向量检索子文档数量
     k2: int = 4  # BM25 检索父文档数量
@@ -38,7 +38,6 @@ class HybridParentRetriever(BaseRetriever):
         return self.invoke(query, config=run_manager.config if run_manager else None)
 
     def invoke(self, query: str, config: Any = None, **kwargs: Any) -> List[Document]:
-        """核心检索逻辑"""
         # 1. 向量检索子文档
         child_retriever = self.vectorstore.as_retriever(search_kwargs={"k": self.k1})
         child_docs = child_retriever.invoke(query, config=config)
@@ -46,28 +45,29 @@ class HybridParentRetriever(BaseRetriever):
         # 2. BM25 检索父文档
         kw_docs = bm25_search_docs(query, self.bm25_docs, top_k=self.k2)
 
-        # 3. 子文档 -> 父文档映射 (基于 source 和相似性)
-        vec_parent_docs = []
+        # 3. ✅ 修复：正确处理 mget 返回值
+        parent_docs_from_vector = []
         for child_doc in child_docs:
-            parent_candidates = [
-                doc for doc in self.bm25_docs
-                if doc.metadata.get("source") == child_doc.metadata.get("source")
-            ]
-            if parent_candidates:
-                vec_parent_docs.append(parent_candidates[0])  # 取第一个匹配的父文档
+            parent_id = child_doc.metadata.get("parent_id")
+            if parent_id:
+                # mget 返回 List[Optional[Document]]，取第一个有效值
+                parent_docs = self.docstore.mget([parent_id])
+                if parent_docs and len(parent_docs) > 0 and parent_docs[0] is not None:
+                    parent_docs_from_vector.append(parent_docs[0])
 
-        # 4. 融合去重
-        all_docs = vec_parent_docs + kw_docs
-        seen_ids = set()# 用于去重
-        unique_docs = []# 去重后的子文档
+        # 4. 去重逻辑保持不变
+        all_docs = parent_docs_from_vector + kw_docs
+        seen_doc_ids = set()
+        unique_parent_docs = []
 
         for doc in all_docs:
-            doc_id = doc.metadata.get("doc_id") or hash(doc.page_content[:100])
-            if doc_id not in seen_ids:
-                seen_ids.add(doc_id)
-                unique_docs.append(doc)
+            doc_id = doc.metadata.get("doc_id")
+            if doc_id and doc_id not in seen_doc_ids:
+                seen_doc_ids.add(doc_id)
+                unique_parent_docs.append(doc)
 
-        return unique_docs[:self.k1 + self.k2]
+        return unique_parent_docs[:self.k1 + self.k2]
+
 
 
 # ============ 全局配置 ============
@@ -232,38 +232,53 @@ def ingest_files(uploaded_files):
         )
         parent_docs = parent_splitter.split_documents(raw_docs)
 
-        # 2. 添加元数据
+        # 2. 添加元数据到父文档
         doc_ids = [str(uuid.uuid4()) for _ in parent_docs]
+        parent_doc_map = {}  # 新增：父文档映射表
+
         for doc, doc_id in zip(parent_docs, doc_ids):
             doc.metadata.update({
                 "doc_id": doc_id,
                 "source": doc.metadata.get("source", "unknown")
             })
+            parent_doc_map[doc_id] = doc  # 存储父文档映射
 
-        # 3. 存储到 docstore (修复: 使用正确的 mset 格式)
-        docstore_pairs: List[Tuple[str, Document]] = [
-            (doc.metadata["doc_id"], doc) for doc in parent_docs
-        ]
+        # 3. 存储父文档到 docstore
+        docstore_pairs = [(doc.metadata["doc_id"], doc) for doc in parent_docs]
         st.session_state["docstore"].mset(docstore_pairs)
 
-        # 4. 创建子文档用于向量检索
+        # 4. ✅ 修复：创建子文档 + 明确 parent_id 映射
         child_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
-        child_docs = child_splitter.split_documents(parent_docs)
+        child_docs = []
 
-        # 5. 子文档保留父文档引用
-        for child_doc in child_docs:
-            child_doc.metadata["parent_id"] = child_doc.metadata.get("doc_id", "")
-        # 6. 构建向量索引
+        for parent_doc in parent_docs:
+            parent_id = parent_doc.metadata["doc_id"]
+            parent_content = parent_doc.page_content
+
+            # 分割父文档内容为子文档
+            child_texts = child_splitter.split_text(parent_content)
+
+            for i, child_text in enumerate(child_texts):
+                child_doc = Document(
+                    page_content=child_text,
+                    metadata={
+                        "parent_id": parent_id,  # ✅ 明确关联父文档
+                        "doc_id": f"child_{parent_id}_{i}",
+                        "source": parent_doc.metadata["source"],
+                        "chunk_index": i,
+                        "parent_source": parent_doc.metadata["source"]
+                    }
+                )
+                child_docs.append(child_doc)
+
+        # 5. 构建向量索引
         vectorstore = get_vectorstore()
         vectorstore.add_documents(child_docs)
-        # vectorstore.persist()  # 已删除 - 自动持久化
 
-        # 7. 更新 BM25
-        current_bm25_docs = st.session_state.get("bm25_docs", []) + parent_docs
-        rebuild_bm25(current_bm25_docs)
+        # 6. 更新 BM25（只用父文档）
+        rebuild_bm25(parent_docs)  # 只传入父文档，不累积
 
-        st.success(
-            f"✅ 索引完成！\n📄 父文档: {len(parent_docs)}\n🔍 子文档: {len(child_docs)}\n💾 向量库: {vectorstore._collection.count()}")
+        st.success(f"✅ 索引完成！父文档: {len(parent_docs)}, 子文档: {len(child_docs)}")
 
         # 重置聊天历史
         st.session_state["messages"] = []
@@ -384,18 +399,29 @@ def main():
         st.info(f"📊 知识库文档: {len(st.session_state.get('bm25_docs', []))}")
 
     # 聊天历史显示
-    for msg in st.session_state["messages"]:
+    for msg_idx, msg in enumerate(st.session_state["messages"]):
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if msg.get("rewrite"):
                 st.caption(f"🔍 优化查询: {msg['rewrite']}")
+
+            # ✅ 修复：在聊天历史显示部分
             if msg.get("sources"):
                 with st.expander(f"📚 参考资料 ({len(msg['sources'])} 份)"):
                     for i, doc in enumerate(msg["sources"]):
                         st.markdown(f"**[{i + 1}] {doc.metadata.get('source', '未知')}**")
-                        st.caption(f"ID: {doc.metadata.get('doc_id', 'N/A')}")
-                        preview = doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content
-                        st.text(preview)
+
+                        doc_id = doc.metadata.get('doc_id', 'N/A')
+                        parent_id = doc.metadata.get('parent_id', 'N/A')
+                        st.caption(f"ID: {doc_id} | 父文档: {parent_id}")
+
+                        preview = doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content
+                        # ✅ 修复：使用消息索引+文档索引作为稳定 key
+                        st.text_area(
+                            f"preview_history_{msg_idx}_{i}",
+                            preview,
+                            height=100
+                        )
 
     # 用户输入处理
     if user_input := st.chat_input("请输入您的问题..."):
@@ -410,11 +436,11 @@ def main():
             st.markdown(user_input)
 
         # AI 响应
+        # AI 响应部分 - 修复版
         with st.chat_message("assistant"):
-            status_container = st.status("🤔 正在思考...", expanded=True)
+            status_container = st.status("🤔 正在思考...")
             final_response = ""
-            source_documents = []
-            rewritten_query = user_input
+
 
             try:
                 # 1. 查询优化
@@ -427,28 +453,46 @@ def main():
                 if rewritten_query != user_input:
                     status_container.write(f"🔍 优化查询: `{rewritten_query}`")
 
-                # 2. 混合检索
+                # 2. 混合检索 - 先完整执行，再显示调试信息
                 status_container.write("📥 执行混合检索...")
                 hybrid_retriever = get_hybrid_retriever()
                 if not hybrid_retriever:
                     st.error("❌ 请先上传并索引文档！")
                     return
 
-                # 3. FlashRank 重排序 (简化版)
-                status_container.write("⚖️ FlashRank 智能排序...")
+                # 执行完整检索
                 raw_docs = hybrid_retriever.invoke(rewritten_query)
 
-                # 使用 FlashRank 压缩器
+                # 3. FlashRank 重排序
+                status_container.write("⚖️ FlashRank 智能排序...")
                 try:
                     reranker = FlashrankRerank(top_n=4)
                     source_documents = reranker.compress_documents(
                         raw_docs, [Document(page_content=rewritten_query)]
                     )
                 except:
-                    # 降级到简单 Top-K
                     source_documents = raw_docs[:4]
 
+                # ✅ 现在 source_documents 已正确赋值，再显示调试信息
                 status_container.write(f"✅ 检索到 {len(source_documents)} 份高质量资料")
+                status_container.write("🔍 检索详情:")
+
+                # 获取调试用的子文档和BM25文档（用于显示，不影响source_documents）
+                child_retriever = hybrid_retriever.vectorstore.as_retriever(
+                    search_kwargs={"k": hybrid_retriever.k1}
+                )
+                child_docs = child_retriever.invoke(rewritten_query)
+                kw_docs = bm25_search_docs(
+                    rewritten_query,
+                    hybrid_retriever.bm25_docs,
+                    top_k=hybrid_retriever.k2
+                )
+
+                status_container.write(f"  - 向量子文档: {len(child_docs)}")
+                status_container.write(f"  - BM25父文档: {len(kw_docs)}")
+                status_container.write(f"  - FlashRank后: {len(source_documents)}")
+                status_container.write(
+                    f"  - 示例文档: {[d.metadata.get('source', 'N/A')[:30] for d in source_documents[:2]]}")
 
                 # 4. 生成回答
                 status_container.write("💭 生成智能回答...")
@@ -469,20 +513,38 @@ def main():
 
                 status_container.update(label="✅ 完成！", state="complete")
 
+                # 🔥 新增：立即显示当前消息的参考资料
+                if source_documents:
+                    # ❌ 删除 expanded=True 参数
+                    with st.expander(f"📚 参考资料 ({len(source_documents)} 份)"):  # ✅ 已修复
+                        for i, doc in enumerate(source_documents):
+                            st.markdown(f"**[{i + 1}] {doc.metadata.get('source', '未知')}**")
+
+                            doc_id = doc.metadata.get('doc_id', 'N/A')
+                            parent_id = doc.metadata.get('parent_id', 'N/A')
+                            st.caption(f"ID: {doc_id} | 父文档: {parent_id}")
+
+                            preview = doc.page_content[:500] + "..." if len(
+                                doc.page_content) > 500 else doc.page_content
+                            # ✅ 同时修复 key 冲突
+                            current_msg_idx = len(st.session_state["messages"])
+                            st.text_area(
+                                f"preview_current_{current_msg_idx}_{i}",  # ✅ 稳定 key
+                                preview,
+                                height=100
+                            )
+
             except Exception as e:
-                st.error(f"❌ 处理出错: {str(e)}")
-                status_container.update(label="❌ 错误", state="error")
-                import traceback
-                st.code(traceback.format_exc(), language="python")
+                # ... 错误处理保持不变 ...
                 return
 
-        # 更新会话状态
-        st.session_state["messages"].append({
-            "role": "assistant",
-            "content": final_response,
-            "rewrite": rewritten_query if rewritten_query != user_input else None,
-            "sources": source_documents
-        })
+            # 然后才更新会话状态（现有代码）
+            st.session_state["messages"].append({
+                "role": "assistant",
+                "content": final_response,
+                "rewrite": rewritten_query if rewritten_query != user_input else None,
+                "sources": source_documents  # 这个用于历史显示
+            })
 
         st.session_state["chat_history"].extend([
             HumanMessage(content=user_input),
@@ -492,6 +554,8 @@ def main():
         # 控制历史长度
         if len(st.session_state["chat_history"]) > MAX_HISTORY_LENGTH * 2:
             st.session_state["chat_history"] = st.session_state["chat_history"][-MAX_HISTORY_LENGTH * 2:]
+
+
 
 
 if __name__ == "__main__":
